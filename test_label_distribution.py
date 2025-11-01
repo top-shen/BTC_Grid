@@ -13,6 +13,7 @@ Run:
 import argparse
 import numpy as np
 import pandas as pd
+import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -93,6 +94,9 @@ def plot_label_hist(counts_train, counts_test, K, out_path):
     axes[1].set_xlim(-0.5, K - 0.5)
 
     fig.tight_layout()
+    # Ensure parent directory exists
+    out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
+    os.makedirs(out_dir, exist_ok=True)
     fig.savefig(out_path, dpi=160)
     print(f"Saved label distribution figure: {out_path}")
 
@@ -105,7 +109,18 @@ def main():
     ap.add_argument("--pred-len", type=int, default=50)
     args = ap.parse_args()
 
-    df = pd.read_csv(args.csv)
+    # Try provided CSV first; then data/<basename>
+    csv_path = args.csv
+    if not os.path.isfile(csv_path):
+        base = os.path.basename(csv_path)
+        candidate = os.path.join("data", base)
+        if os.path.isfile(candidate):
+            print(f"CSV not found at '{csv_path}', using '{candidate}' from data/")
+            csv_path = candidate
+        else:
+            raise FileNotFoundError(f"CSV not found: '{args.csv}' or '{candidate}'")
+    print(f"Loading CSV: {csv_path}")
+    df = pd.read_csv(csv_path)
 
     # Time-ordered split 80/20 like main.py (no shuffle)
     n = len(df)
@@ -116,7 +131,8 @@ def main():
     counts_train = analyze_split(train_df, "train", args.num_bins, args.window_size, args.pred_len)
     counts_test = analyze_split(test_df, "test", args.num_bins, args.window_size, args.pred_len)
 
-    out_path = "label_distribution.png"
+    # Save to results/
+    out_path = os.path.join("results", "label_distribution.png")
     plot_label_hist(counts_train, counts_test, args.num_bins, out_path)
 
 

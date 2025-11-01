@@ -1,109 +1,34 @@
 # -*- coding: utf-8 -*-
 # model.py
-from typing import Optional, Tuple
+from typing import Optional, Sequence
 import torch
 import torch.nn as nn
 
 
-# Shared helper to embed 4-channel token inputs consistently across models.
-def _embed_channels_4(
+def _embed_channels(
     x: torch.Tensor,
-    embeds: Tuple[nn.Embedding, nn.Embedding, nn.Embedding, nn.Embedding],
+    embeds: Sequence[nn.Module],  # accept generic nn.Module sequence to play well with ModuleList
     channel_combine: str,
     channel_proj: Optional[nn.Module],
 ) -> torch.Tensor:
-    """Embed [B,T,4] token tensor with four separate embeddings and combine.
+    """Embed [B,T,C] token tensor with C separate embeddings and combine.
 
-    This removes duplicated logic in multiple model classes.
+    - channel_combine == 'sum': elementwise sum of per-channel embeddings.
+    - channel_combine == 'concat': concat along last dim then project back to d_model.
     """
-    assert x.dim() == 3 and x.size(-1) == 4, "expect x shape [B,T,4] with channels=[main,ma5,ma10,ma20]"
-    embed_main, embed_ma5, embed_ma10, embed_ma20 = embeds
-    h_main = embed_main(x[..., 0])
-    h5 = embed_ma5(x[..., 1])
-    h10 = embed_ma10(x[..., 2])
-    h20 = embed_ma20(x[..., 3])
+    assert x.dim() == 3 and x.size(-1) == len(embeds), (
+        f"expect x shape [B,T,{len(embeds)}] to match num_channels"
+    )
+    hs = [emb(x[..., i]) for i, emb in enumerate(embeds)]
     if channel_combine == "concat":
         assert channel_proj is not None, "channel_proj must be set when using concat"
-        h = torch.cat([h_main, h5, h10, h20], dim=-1)
+        h = torch.cat(hs, dim=-1)
         h = channel_proj(h)
     else:
-        h = h_main + h5 + h10 + h20
+        h = hs[0]
+        for t in hs[1:]:
+            h = h + t
     return h
-
-
-class GridTransformer(nn.Module):
-    def __init__(
-        self,
-        vocab_size=60,
-        # Bump defaults to a larger-capacity encoder
-        d_model=128,
-        num_heads=8,
-        num_layers=3,
-        max_len=300,
-        # 合理的可调参数：
-        ff_dim=1024,  # 稍小于 2048，综合性能与参数量
-        dropout=0.2,  # Transformer 层内 dropout（attn/ffn）
-        emb_dropout=0.2,  # 嵌入后（token+pos）dropout
-        head_dropout=0.2,  # 回归头内的 dropout
-        channel_combine="concat",  # "concat" 或 "sum"
-    ):
-        super().__init__()
-        # 四个通道使用不同的 embedding：主序列、ma5、ma10、ma20
-        self.embed_main = nn.Embedding(vocab_size, d_model)
-        self.embed_ma5 = nn.Embedding(vocab_size, d_model)
-        self.embed_ma10 = nn.Embedding(vocab_size, d_model)
-        self.embed_ma20 = nn.Embedding(vocab_size, d_model)
-        self.channel_combine = channel_combine
-        if channel_combine == "concat":
-            self.channel_proj = nn.Linear(d_model * 4, d_model)
-        else:
-            self.channel_proj = None  # sum 后维度保持 d_model
-
-        self.pos_embed = nn.Embedding(max_len, d_model)  # 学习型位置嵌入
-        self.emb_drop = nn.Dropout(emb_dropout)
-
-        # Transformer 编码器；将 dim_feedforward 暴露为可调以便控制容量
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=num_heads,
-            dim_feedforward=ff_dim,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-
-        # Regression head：输出2维参数 [mu, log_sigma]
-        # 说明：为重尾/异方差回归（Student-t NLL）提供均值与尺度参数
-        self.reg_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Dropout(head_dropout),
-            nn.Linear(d_model, 2),  # [mu, log_sigma]
-        )
-
-    def _embed_channels(self, x):
-        """Embed [B,T,4] tokens via four embeddings and combine into [B,T,d_model]."""
-        return _embed_channels_4(
-            x,
-            (self.embed_main, self.embed_ma5, self.embed_ma10, self.embed_ma20),
-            self.channel_combine,
-            self.channel_proj,
-        )
-
-    def forward(self, x):
-        # 输入固定为 [B, T, 4]，检查在嵌入函数中完成
-        B, T, _ = x.shape
-        device = x.device
-
-        h = self._embed_channels(x)  # [B, T, d_model]
-        pos = torch.arange(T, device=device).unsqueeze(0).expand(B, T)  # [B, T]
-        h = h + self.pos_embed(pos)  # 注入位置信息
-        h = self.emb_drop(h)
-        h = self.encoder(h)
-        # 对下一步预测，更稳妥的是取最后时间步向量，而非均值
-        h_last = h[:, -1, :]
-        params = self.reg_head(h_last)  # [B, 2]
-        return params
 
 
 class PatchTST(nn.Module):
@@ -111,16 +36,17 @@ class PatchTST(nn.Module):
     PatchTST-style encoder (closer to common source impl) for sequence-to-one regression
     on tokenized grids.
 
-    Changes vs previous version (Plan A):
-    - Pre-norm Transformer (norm_first=True)
-    - Learnable patch positional embedding as Parameter + dropout
-    - CLS token support and pre-head LayerNorm
-    - Keep existing token embedding and Conv1d patching
+    Notes:
+    - By default this head now outputs 3 values intended for quantile regression
+      (q10, q50, q90). If you need the previous [mu, log_sigma] head for Student-t
+      modelling, set `out_dim=2` when constructing the module.
+    - The trunk/encoder is unchanged.
     """
 
     def __init__(
         self,
         vocab_size=60,
+        num_channels: int = 7,
         # Moderate defaults: less reduction than lite, still smaller than the original heavy cfg
         d_model=96,
         num_heads=8,
@@ -137,21 +63,23 @@ class PatchTST(nn.Module):
         head_kind="mlp",  # "mlp" or "linear"
         patch_depthwise=True,  # depthwise separable conv for patching
         channel_combine="concat",  # "sum" (fewer params) or "concat" (richer)
+        out_dim: int = 3,  # default to 3 quantile outputs: [q10, q50, q90]
     ):
         super().__init__()
         self.pool = pool
         self.max_patches = int(max_patches)
         self.head_kind = head_kind
+        self.out_dim = int(out_dim)
 
-        # Token embeddings for 4 channels
-        self.embed_main = nn.Embedding(vocab_size, d_model)
-        self.embed_ma5 = nn.Embedding(vocab_size, d_model)
-        self.embed_ma10 = nn.Embedding(vocab_size, d_model)
-        self.embed_ma20 = nn.Embedding(vocab_size, d_model)
-        # Combine four channel embeddings; "sum" removes an extra projection layer
+        # Token embeddings per channel (e.g., [main, ma5, ma10, ma20, vwap5, vwap10, vwap20])
+        self.num_channels = int(num_channels)
+        self.embeds = nn.ModuleList(
+            [nn.Embedding(vocab_size, d_model) for _ in range(self.num_channels)]
+        )
+        # Combine channel embeddings; "sum" removes an extra projection layer
         self.channel_combine = channel_combine
         if channel_combine == "concat":
-            self.channel_proj = nn.Linear(d_model * 4, d_model)
+            self.channel_proj = nn.Linear(d_model * self.num_channels, d_model)
         else:
             self.channel_proj = None
         self.emb_drop = nn.Dropout(emb_dropout)
@@ -200,27 +128,24 @@ class PatchTST(nn.Module):
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
         if head_kind == "linear":
-            # 输出 [mu, log_sigma]
-            self.reg_head = nn.Linear(d_model, 2)
+            # 默认输出为 3 维（q10, q50, q90）；如需旧版 [mu, log_sigma]，请构造 out_dim=2
+            self.reg_head = nn.Linear(d_model, self.out_dim)
         else:
             self.reg_head = nn.Sequential(
                 nn.Linear(d_model, d_model),
                 nn.ReLU(),
                 nn.Dropout(head_dropout),
-                nn.Linear(d_model, 2),  # [mu, log_sigma]
+                nn.Linear(d_model, self.out_dim),  # 通常为 3: [q10, q50, q90]
             )
 
     def _embed_channels(self, x):
-        """x: [B,T,4] long -> [B,T,d_model]"""
-        return _embed_channels_4(
-            x,
-            (self.embed_main, self.embed_ma5, self.embed_ma10, self.embed_ma20),
-            self.channel_combine,
-            self.channel_proj,
+        """x: [B,T,C] long -> [B,T,d_model]"""
+        return _embed_channels(
+            x, tuple(self.embeds), self.channel_combine, self.channel_proj  # tuple() satisfies Sequence for type-checkers
         )
 
     def forward(self, x):
-        # 固定 4 通道，形状断言在嵌入函数中完成
+        # 多通道输入，形状断言在嵌入函数中完成
         h = self._embed_channels(x)  # [B, T, d_model]
         h = self.emb_drop(h)
 
