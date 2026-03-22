@@ -1,36 +1,50 @@
-# -*- coding: utf-8 -*-
-from typing import Dict
+﻿from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 
-def last_main_grid(batch_x: torch.Tensor) -> torch.Tensor:
-    """Return last-step main-channel token from [B,T,C] tokens as float.
+BatchTuple = Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]
 
-    Only requires at least one channel; channel-0 is treated as main.
+
+def unpack_batch(batch) -> BatchTuple:
+    """Support both baseline batches and tokenizer batches.
+
+    Baseline:
+      (x_grid, y_float, y_cls)
+
+    Tokenizer modes:
+      (x_grid, x_tok, y_float, y_cls)
     """
+    if len(batch) == 3:
+        x_grid, y_float, y_cls = batch
+        x_tok = None
+    elif len(batch) == 4:
+        x_grid, x_tok, y_float, y_cls = batch
+    else:
+        raise ValueError(f"Unexpected batch format with {len(batch)} items")
+    return x_grid, x_tok, y_float, y_cls
+
+
+def last_main_grid(batch_x: torch.Tensor) -> torch.Tensor:
     assert batch_x.dim() == 3 and batch_x.size(-1) >= 1, "expect x shape [B,T,C] with C>=1"
     return batch_x[:, -1, 0].float()
 
 
-def compute_and_plot_delta_distribution(
-    loader: DataLoader, name: str, out_path: str
-) -> Dict[str, float]:
-    """Collect deltas=y_abs-last and plot histogram. Returns basic stats dict."""
+def compute_and_plot_delta_distribution(loader: DataLoader, name: str, out_path: str) -> Dict[str, float]:
     import matplotlib.pyplot as plt
 
     deltas = []
     with torch.no_grad():
-        for x, y_float, _ in loader:
-            last = last_main_grid(x)
+        for batch in loader:
+            x_grid, _, y_float, _ = unpack_batch(batch)
+            last = last_main_grid(x_grid)
             deltas.append((y_float.float() - last).numpy())
     if not deltas:
         print(f"[{name}] no data for delta distribution")
         return {"count": 0}
     deltas = np.concatenate(deltas, axis=0)
 
-    # Basic stats
     q = np.percentile(deltas, [5, 25, 50, 75, 95])
     frac_1 = np.mean((deltas >= -1.0) & (deltas <= 1.0))
     frac_2 = np.mean((deltas >= -2.0) & (deltas <= 2.0))
@@ -41,7 +55,6 @@ def compute_and_plot_delta_distribution(
         f"|d|<=1:{frac_1:.3f}, |d|<=2:{frac_2:.3f}, |d|<=5:{frac_5:.3f}"
     )
 
-    # Histogram (1-grid bins)
     bins = np.arange(-40.5, 40.5 + 1.0, 1.0).tolist()
     plt.figure(figsize=(8, 4))
     plt.hist(deltas, bins=bins, color="steelblue", edgecolor="none", alpha=0.85)
@@ -62,19 +75,12 @@ def compute_and_plot_delta_distribution(
 
 
 def build_bucketed_sampler(dataset) -> WeightedRandomSampler:
-    """Build a sampler that balances positive/negative samples by (y_float - last).
-
-    We scan the training dataset once to compute the sign of delta = y_abs - last
-    for each sample, then assign inverse-frequency weights to positives/negatives
-    so that the expected draw ratio is ~50/50. Zero-delta samples (rare) receive
-    the average of pos/neg weights.
-    """
-    # One pass to compute sign per sample while preserving order
     tmp_loader = DataLoader(dataset, batch_size=4096, shuffle=False)
-    signs = []  # +1 pos, -1 neg, 0 zero
+    signs = []
     with torch.no_grad():
-        for x, y_float, _ in tmp_loader:
-            last = last_main_grid(x)
+        for batch in tmp_loader:
+            x_grid, _, y_float, _ = unpack_batch(batch)
+            last = last_main_grid(x_grid)
             d = (y_float.float() - last).numpy()
             signs.append(np.sign(d).astype(np.int8))
 
@@ -84,7 +90,6 @@ def build_bucketed_sampler(dataset) -> WeightedRandomSampler:
     n_neg = int((signs < 0).sum())
     n_zero = n - n_pos - n_neg
 
-    # Report split for diagnostics
     if n > 0:
         print(
             "Sign split (train): "
@@ -92,35 +97,24 @@ def build_bucketed_sampler(dataset) -> WeightedRandomSampler:
         )
 
     if n_pos == 0 or n_neg == 0:
-        # Degenerate: cannot balance -> uniform weights
-        print(
-            f"Sign-balanced sampler: degenerate split (pos={n_pos}, neg={n_neg}), use uniform weights."
-        )
+        print(f"Sign-balanced sampler: degenerate split (pos={n_pos}, neg={n_neg}), use uniform weights.")
         return WeightedRandomSampler([1.0] * n, num_samples=n, replacement=True)
 
-    # Inverse-frequency weighting to target 50/50 mixture
     w_pos = n / (2.0 * n_pos)
     w_neg = n / (2.0 * n_neg)
     w_zero = 0.5 * (w_pos + w_neg) if n_zero > 0 else 0.0
+    weights = np.where(signs > 0, w_pos, np.where(signs < 0, w_neg, w_zero)).astype(np.float32)
 
-    weights = np.where(
-        signs > 0,
-        w_pos,
-        np.where(signs < 0, w_neg, w_zero),
-    ).astype(np.float32)
-
-    print(
-        f"Sign-balanced weights: w_pos={w_pos:.4f}, w_neg={w_neg:.4f}, zero_w={w_zero:.4f}"
-    )
+    print(f"Sign-balanced weights: w_pos={w_pos:.4f}, w_neg={w_neg:.4f}, zero_w={w_zero:.4f}")
     return WeightedRandomSampler(weights.tolist(), num_samples=n, replacement=True)
 
 
 def baseline_last_mse(loader: DataLoader) -> float:
-    """Compute MSE of persistence baseline (predict last grid)."""
     total, cnt = 0.0, 0
     with torch.no_grad():
-        for x, y_float, _ in loader:
-            last = x[:, -1, 0].float()
+        for batch in loader:
+            x_grid, _, y_float, _ = unpack_batch(batch)
+            last = x_grid[:, -1, 0].float()
             y_abs = y_float.float()
             total += ((last - y_abs) ** 2).sum().item()
             cnt += y_abs.numel()
