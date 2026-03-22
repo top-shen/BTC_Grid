@@ -33,6 +33,7 @@ print("device:", device)
 parser = argparse.ArgumentParser()
 parser.add_argument("--csv", type=str, default="./BTCUSDT_5m.csv")
 parser.add_argument("--epochs", type=int, default=20)
+parser.add_argument("--patience", type=int, default=5)
 parser.add_argument("--bins", type=int, default=60)
 parser.add_argument("--batch", type=int, default=256)
 parser.add_argument("--lr", type=float, default=3e-4)
@@ -133,7 +134,7 @@ else:
 
 best_val = float("inf")
 no_improve_count = 0
-patience = 1
+patience = int(args.patience)
 trainer = QuantileTrainer(model=model, device=device, quantiles=(0.1, 0.5, 0.9), lambda_vq=args.lambda_vq)
 
 for epoch in range(int(args.epochs)):
